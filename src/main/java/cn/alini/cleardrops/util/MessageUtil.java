@@ -8,13 +8,6 @@ import net.minecraft.network.chat.TextColor;
 import java.util.HashMap;
 import java.util.Map;
 
-/**
- * 将带有占位符与渐变标签的字符串渲染为 Component。
- * 支持：
- * - 占位符：形如 {name}，由调用方传入 map 替换。
- * - 渐变标签：<gradient:#RRGGBB:#RRGGBB>文本</gradient>
- *   会对“文本”的每个字符进行线性渐变上色（按 Unicode 代码点处理，兼容中文/emoji）。
- */
 public final class MessageUtil {
 
     private MessageUtil() {}

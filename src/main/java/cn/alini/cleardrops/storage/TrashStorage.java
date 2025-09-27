@@ -9,12 +9,10 @@ public class TrashStorage extends SimpleContainer {
         super(size);
     }
 
-    // 合并插入，返回未能插入的剩余
     public ItemStack insertStack(ItemStack stack) {
         if (stack.isEmpty()) return ItemStack.EMPTY;
         ItemStack toInsert = stack.copy();
 
-        // 先合并同类物品
         for (int i = 0; i < this.getContainerSize(); i++) {
             ItemStack cur = this.getItem(i);
             if (!cur.isEmpty() && ItemStack.isSameItemSameTags(cur, toInsert)) {
@@ -27,7 +25,6 @@ public class TrashStorage extends SimpleContainer {
                 }
             }
         }
-        // 再放空位
         for (int i = 0; i < this.getContainerSize(); i++) {
             ItemStack cur = this.getItem(i);
             if (cur.isEmpty()) {
@@ -45,7 +42,6 @@ public class TrashStorage extends SimpleContainer {
 
     @Override
     public boolean canPlaceItem(int index, ItemStack stack) {
-        // 禁止玩家向回收站放入
         return false;
     }
 }

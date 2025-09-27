@@ -12,6 +12,8 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.AABB;
 import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.event.entity.EntityJoinLevelEvent;
+import net.minecraftforge.event.entity.EntityLeaveLevelEvent;
 import net.minecraftforge.registries.ForgeRegistries;
 import net.minecraftforge.server.ServerLifecycleHooks;
 
@@ -19,9 +21,8 @@ import java.util.*;
 
 public class ServerScheduler {
 
-    // 运行时参数（支持热重载）
-    private int intervalTicks = 20 * 60 * 5;   // 默认 5 分钟
-    private int keepTicks = 20 * 60 * 2;       // 默认 2 分钟
+    private int intervalTicks = 20 * 60 * 5;
+    private int keepTicks = 20 * 60 * 2;
     private boolean autoCollect = true;
     private boolean announce = true;
 
@@ -32,23 +33,23 @@ public class ServerScheduler {
     private String msgCollected = "已回收掉落物，共 {entities} 个实体。使用 /cleardrops gui 领取，{keep}s 后清空。";
     private String msgPurged = "回收站已到期，清空 {slots} 个槽位。";
     private String msgStatus = "回收站：{slotsUsed}/{slotsTotal} 槽，物品 {items} 个；清空倒计时：{keep}；自动回收：{auto}，间隔：{interval}s，保留：{keepCfg}s，广播：{announce}。";
-    private String msgHelp = "<gradient:#7AD7F0:#4FC3F7>Cleardrops 帮助</gradient>\\n..."
-            .replace("\\n", "\n");
+    private String msgHelp = "<gradient:#7AD7F0:#4FC3F7>Cleardrops 帮助</gradient>\n...";
     private String msgCmdCollect = "已回收掉落物，共 {entities} 个实体。{keep}s 内可在回收站领取。";
+    private String msgCmdCollectNone = "没有可清理的掉落物！";
     private String msgCmdPurge = "已清空回收站，清除了 {slots} 个槽位中的物品（黑名单物品已跳过）。";
 
-    // 虚空保护运行时
     private boolean voidProtect = true;
     private int voidRaiseMax = 6;
     private boolean voidResetVel = true;
+    private static final int VOID_PROTECT_BUDGET_PER_TICK = 1024;
 
-    // 黑名单（物品 ID，如 minecraft:nether_star）
     private final Set<ResourceLocation> blacklist = new HashSet<>();
 
-    // 计时器
     private int collectCountdown = intervalTicks;
-    private int purgeCountdown = -1; // <0 表示未安排清空
+    private int purgeCountdown = -1;
     private final Set<Integer> warnedThisCycle = new HashSet<>();
+
+    private final LinkedHashSet<ItemEntity> trackedItems = new LinkedHashSet<>();
 
     private final TrashStorage trashStorage = new TrashStorage(54);
 
@@ -56,7 +57,6 @@ public class ServerScheduler {
         return trashStorage;
     }
 
-    // 从配置应用到运行时（加载/热重载/命令触发）
     public synchronized void applyConfig() {
         int newInterval = CDConfig.TICKS_PER_COLLECT.get();
         int newKeep = CDConfig.TICKS_KEEP_AFTER_COLLECT.get();
@@ -65,47 +65,38 @@ public class ServerScheduler {
 
         this.prefixRaw = CDConfig.PREFIX.get();
 
-        // 预警秒数
         List<? extends Integer> ws = CDConfig.WARN_SECONDS.get();
         this.warnSeconds = new ArrayList<>();
-        for (Object o : ws) {
-            if (o instanceof Integer i && i >= 0) this.warnSeconds.add(i);
-        }
+        for (Object o : ws) if (o instanceof Integer i && i >= 0) this.warnSeconds.add(i);
         this.warnSeconds.sort(Comparator.reverseOrder());
 
-        // 消息模板
         this.msgPreCollect = CDConfig.MSG_PRE_COLLECT.get();
         this.msgCollected = CDConfig.MSG_COLLECTED.get();
         this.msgPurged = CDConfig.MSG_PURGED.get();
         this.msgStatus = CDConfig.MSG_STATUS.get();
         this.msgHelp = CDConfig.MSG_HELP.get().replace("\\n", "\n");
         this.msgCmdCollect = CDConfig.MSG_CMD_COLLECT.get();
+        this.msgCmdCollectNone = CDConfig.MSG_CMD_COLLECT_NONE.get();
         this.msgCmdPurge = CDConfig.MSG_CMD_PURGE.get();
 
-        // 虚空保护
         this.voidProtect = CDConfig.ENABLE_VOID_PROTECT.get();
         this.voidRaiseMax = CDConfig.VOID_RAISE_MAX_STEPS.get();
         this.voidResetVel = CDConfig.VOID_RESET_VELOCITY.get();
 
-        // 黑名单
         this.blacklist.clear();
         for (Object o : CDConfig.ITEM_BLACKLIST.get()) {
             if (o instanceof String s && s.contains(":")) {
-                try {
-                    this.blacklist.add(new ResourceLocation(s));
-                } catch (Exception ignored) {}
+                try { this.blacklist.add(new ResourceLocation(s)); } catch (Exception ignored) {}
             }
         }
 
         int oldInterval = this.intervalTicks;
         int oldKeep = this.keepTicks;
-
         this.intervalTicks = newInterval;
         this.keepTicks = newKeep;
         this.autoCollect = newAuto;
         this.announce = newAnnounce;
 
-        // 平滑调整倒计时
         if (collectCountdown > newInterval || oldInterval != newInterval) {
             collectCountdown = Math.min(collectCountdown, newInterval);
             if (collectCountdown <= 0) collectCountdown = newInterval;
@@ -114,7 +105,7 @@ public class ServerScheduler {
         if (purgeCountdown >= 0 && (purgeCountdown > newKeep || oldKeep != newKeep)) {
             purgeCountdown = Math.min(purgeCountdown, newKeep);
             if (purgeCountdown <= 0 && newKeep > 0) purgeCountdown = newKeep;
-            if (newKeep == 0) purgeCountdown = 0; // 立即清空
+            if (newKeep == 0) purgeCountdown = 0;
         }
     }
 
@@ -123,7 +114,6 @@ public class ServerScheduler {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server == null) return;
 
-        // 自动收集与预警
         if (autoCollect) {
             int secBefore = (collectCountdown + 19) / 20;
             if (announce && warnSeconds.contains(secBefore) && !warnedThisCycle.contains(secBefore)) {
@@ -149,7 +139,6 @@ public class ServerScheduler {
             }
         }
 
-        // 自动清空
         if (purgeCountdown >= 0) {
             if (--purgeCountdown == 0) {
                 int cleared = purgeNow();
@@ -161,54 +150,82 @@ public class ServerScheduler {
             }
         }
 
-        // 虚空物品保护
-        if (voidProtect) {
-            protectVoidItems(server);
+        if (voidProtect && !trackedItems.isEmpty()) {
+            int processed = 0;
+            Iterator<ItemEntity> it = trackedItems.iterator();
+            while (it.hasNext() && processed < VOID_PROTECT_BUDGET_PER_TICK) {
+                ItemEntity ie = it.next();
+                if (ie.isRemoved() || ie.level().isClientSide) {
+                    it.remove();
+                    continue;
+                }
+                if (!(ie.level() instanceof ServerLevel level)) {
+                    it.remove();
+                    continue;
+                }
+                int minY = level.getMinBuildHeight();
+                if (ie.getY() < minY) {
+                    double x = Math.floor(ie.getX()) + 0.5;
+                    double z = Math.floor(ie.getZ()) + 0.5;
+                    int y = minY + 1;
+
+                    BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos((int) Math.floor(x), y, (int) Math.floor(z));
+                    int steps = 0;
+                    while (steps < voidRaiseMax && !level.isEmptyBlock(pos)) {
+                        pos.setY(pos.getY() + 1);
+                        steps++;
+                    }
+                    if (level.isEmptyBlock(pos.below())) {
+                        pos.setY(pos.getY() + 1);
+                    }
+
+                    ie.setPos(x, pos.getY() + 0.25, z);
+                    if (voidResetVel) ie.setDeltaMovement(0, 0, 0);
+                    ie.setOnGround(true);
+                }
+                processed++;
+            }
         }
     }
 
-    // 便于命令调用的无参版本
+    public void onEntityJoinLevel(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (event.getEntity() instanceof ItemEntity ie) {
+            trackedItems.add(ie);
+        }
+    }
+
+    public void onEntityLeaveLevel(EntityLeaveLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (event.getEntity() instanceof ItemEntity ie) {
+            trackedItems.remove(ie);
+        }
+    }
+
     public int collectNow() {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server == null) return 0;
         return collectNow(server);
     }
 
-    // 真正执行收集（已修正：黑名单物品不参与收集，留在世界中）
     public int collectNow(MinecraftServer server) {
         int entitiesMoved = 0;
-
         for (ServerLevel level : server.getAllLevels()) {
-            // 仅遍历已加载区块内实体
             AABB box = new AABB(-3.0E7, level.getMinBuildHeight(), -3.0E7,
                     3.0E7, level.getMaxBuildHeight(), 3.0E7);
-
             List<ItemEntity> items = level.getEntitiesOfClass(ItemEntity.class, box, e ->
                     !e.isRemoved() && !e.getItem().isEmpty());
-
             for (ItemEntity e : items) {
                 ItemStack stack = e.getItem();
-
-                // 关键修正：黑名单物品不收集，不移除实体
-                if (isBlacklisted(stack)) {
-                    continue;
-                }
-
+                if (isBlacklisted(stack)) continue;
                 ItemStack rem = trashStorage.insertStack(stack);
-                if (rem.isEmpty()) {
-                    e.discard();
-                } else if (rem.getCount() != stack.getCount()) {
-                    e.setItem(rem);
-                } else {
-                    // 仓库满，收不进，保持实体不变
-                    continue;
-                }
+                if (rem.isEmpty()) e.discard();
+                else if (rem.getCount() != stack.getCount()) e.setItem(rem);
+                else continue;
                 entitiesMoved++;
             }
         }
-        if (entitiesMoved > 0) {
-            purgeCountdown = keepTicks;
-        }
+        if (entitiesMoved > 0) purgeCountdown = keepTicks;
         return entitiesMoved;
     }
 
@@ -216,11 +233,7 @@ public class ServerScheduler {
         int cleared = 0;
         for (int i = 0; i < trashStorage.getContainerSize(); i++) {
             ItemStack s = trashStorage.getItem(i);
-            if (!s.isEmpty()) {
-                if (isBlacklisted(s)) {
-                    // 黑名单物品不清空
-                    continue;
-                }
+            if (!s.isEmpty() && !isBlacklisted(s)) {
                 trashStorage.setItem(i, ItemStack.EMPTY);
                 cleared++;
             }
@@ -234,7 +247,6 @@ public class ServerScheduler {
         int slotsUsed = 0;
         int totalItems = 0;
         int blacklistedStacks = 0;
-
         for (int i = 0; i < slotsTotal; i++) {
             ItemStack s = trashStorage.getItem(i);
             if (!s.isEmpty()) {
@@ -244,7 +256,6 @@ public class ServerScheduler {
             }
         }
         String keepDisp = purgeCountdown >= 0 ? (purgeCountdown / 20) + "s" : "未安排";
-
         Map<String, String> ph = new HashMap<>();
         ph.put("slotsUsed", String.valueOf(slotsUsed));
         ph.put("slotsTotal", String.valueOf(slotsTotal));
@@ -255,16 +266,13 @@ public class ServerScheduler {
         ph.put("keepCfg", String.valueOf(keepTicks / 20));
         ph.put("announce", String.valueOf(announce));
         ph.put("blacklistedStacks", String.valueOf(blacklistedStacks));
-
         Component content = MessageUtil.render(msgStatus, ph);
         Component prefix = MessageUtil.render(prefixRaw);
         return MessageUtil.withPrefix(prefix, content);
     }
 
     public Component helpMessage() {
-        Component prefix = MessageUtil.render(prefixRaw);
-        Component content = MessageUtil.render(msgHelp);
-        return MessageUtil.withPrefix(prefix, content);
+        return MessageUtil.withPrefix(MessageUtil.render(prefixRaw), MessageUtil.render(msgHelp));
     }
 
     public Component cmdCollectFeedback(int moved) {
@@ -272,18 +280,16 @@ public class ServerScheduler {
                 "entities", String.valueOf(moved),
                 "keep", String.valueOf(keepTicks / 20)
         );
-        return MessageUtil.withPrefix(
-                MessageUtil.render(prefixRaw),
-                MessageUtil.render(msgCmdCollect, ph)
-        );
+        return MessageUtil.withPrefix(MessageUtil.render(prefixRaw), MessageUtil.render(msgCmdCollect, ph));
+    }
+
+    public Component cmdCollectNoneFeedback() {
+        return MessageUtil.withPrefix(MessageUtil.render(prefixRaw), MessageUtil.render(msgCmdCollectNone));
     }
 
     public Component cmdPurgeFeedback(int cleared) {
         Map<String, String> ph = Map.of("slots", String.valueOf(cleared));
-        return MessageUtil.withPrefix(
-                MessageUtil.render(prefixRaw),
-                MessageUtil.render(msgCmdPurge, ph)
-        );
+        return MessageUtil.withPrefix(MessageUtil.render(prefixRaw), MessageUtil.render(msgCmdPurge, ph));
     }
 
     private void broadcastPrefixed(MinecraftServer server, String template, Map<String, String> ph) {
@@ -296,40 +302,5 @@ public class ServerScheduler {
     private boolean isBlacklisted(ItemStack stack) {
         ResourceLocation id = ForgeRegistries.ITEMS.getKey(stack.getItem());
         return id != null && blacklist.contains(id);
-    }
-
-    // 虚空物品保护：把 minY 以下的物品拉回到 minY+ 附近的可生存空气位置
-    private void protectVoidItems(MinecraftServer server) {
-        for (ServerLevel level : server.getAllLevels()) {
-            int minY = level.getMinBuildHeight();
-            AABB box = new AABB(-3.0E7, Integer.MIN_VALUE / 4.0, -3.0E7,
-                    3.0E7, minY, 3.0E7);
-            List<ItemEntity> items = level.getEntitiesOfClass(ItemEntity.class, box, e ->
-                    !e.isRemoved() && !e.getItem().isEmpty());
-
-            for (ItemEntity e : items) {
-                double x = Math.floor(e.getX()) + 0.5;
-                double z = Math.floor(e.getZ()) + 0.5;
-                int y = minY + 1;
-
-                BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos((int)Math.floor(x), y, (int)Math.floor(z));
-
-                // 若当前位置非空气，则向上寻找空气位置，最多 voidRaiseMax 步
-                int steps = 0;
-                while (steps < voidRaiseMax && !level.isEmptyBlock(pos)) {
-                    pos.setY(pos.getY() + 1);
-                    steps++;
-                }
-                // 再确保脚下非空气（避免继续下落）
-                BlockPos below = pos.below();
-                if (level.isEmptyBlock(below)) {
-                    pos.setY(pos.getY() + 1);
-                }
-
-                e.setPos(x, pos.getY() + 0.25, z);
-                if (voidResetVel) e.setDeltaMovement(0, 0, 0);
-                e.setOnGround(true);
-            }
-        }
     }
 }

@@ -1,13 +1,12 @@
 package cn.alini.cleardrops.command;
 
 import cn.alini.cleardrops.Cleardrops;
-import cn.alini.cleardrops.util.MessageUtil;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.MenuProvider;
-import net.minecraft.world.SimpleMenuProvider; // 1.20.1
+import net.minecraft.world.SimpleMenuProvider;
 import net.minecraft.world.inventory.ChestMenu;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -43,7 +42,11 @@ public class CleardropsCommands {
 
     private static int collect(CommandSourceStack src) {
         int moved = Cleardrops.SCHEDULER.collectNow();
-        src.sendSuccess(() -> Cleardrops.SCHEDULER.cmdCollectFeedback(moved), true);
+        if (moved > 0) {
+            src.sendSuccess(() -> Cleardrops.SCHEDULER.cmdCollectFeedback(moved), true);
+        } else {
+            src.sendSuccess(() -> Cleardrops.SCHEDULER.cmdCollectNoneFeedback(), true);
+        }
         return 1;
     }
 
@@ -54,10 +57,10 @@ public class CleardropsCommands {
                             ChestMenu.sixRows(containerId, playerInv, Cleardrops.SCHEDULER.getTrashStorage()),
                     Component.literal("回收站")
             );
-            sp.openMenu(provider); // 原版容器，客户端无需安装模组
+            sp.openMenu(provider);
             return 1;
         }
-        src.sendFailure(MessageUtil.render("只能由玩家执行。"));
+        src.sendFailure(Component.literal("只能由玩家执行。"));
         return 0;
     }
 
@@ -74,7 +77,7 @@ public class CleardropsCommands {
 
     private static int reload(CommandSourceStack src) {
         Cleardrops.SCHEDULER.applyConfig();
-        src.sendSuccess(() -> MessageUtil.render("已从配置文件应用参数。"), true);
+        src.sendSuccess(() -> Component.literal("已从配置文件应用参数。"), true);
         return 1;
     }
 }
